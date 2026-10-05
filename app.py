@@ -13,7 +13,8 @@
   新链接沿用同一参与者的稿件、版本、分配、意见与问答，不重建身份、不使意见失效。
 - 公布前主持人可凭主持链接与姓名移除成员（不能补人、不能恢复）：留存成员按原录入顺序
   重新闭合互评环，移除后至少留 3 人。退出者的个人链接永久失效（一切读取与写入 404），
-  其发出或收到的意见均不计入公布条件；仅"原来评退出者"的人改评下一位留存成员，
+  其发出或收到的意见均不计入公布条件；仅"原来评退出者"的人改评下一位留存成员
+  （退出者原为当前首位时，即留存者中录入顺序最末的一位——末位评首位），
   其旧意见失效并换发新的匿名分配凭据，其他人的稿件、版本、意见与链接全部保留。
 - 参与状态随快照返回不暴露作者身份的分配凭据；提交意见同时校验凭据与稿件版本，
   分配改变后缺少凭据或沿用旧凭据一律 409（即使两篇稿件版本号相同）；分配从未变过时
@@ -499,8 +500,9 @@ def remove_participant(host_token):
     - 退出者标记为不再留存（active=0）：其个人链接（以及换发前的历史链接）永久失效，
       之后的状态读取与一切合法写入（改稿、意见、问题、答复、换发）均 404。
     - 留存成员按原录入顺序重新闭合互评环；退出者发出或收到的意见一律不计入公布条件。
-      仅"原来评退出者"的留存成员（即录入顺序中退出者前面最近的一位留存者）改评下一位
-      留存成员：其旧意见失效（valid=0）并换发新的匿名分配凭据（nonce 更新、gen+1）；
+      仅"原来评退出者"的留存成员改评下一位留存成员：即录入顺序中退出者前面最近的
+      一位留存者；退出者原为当前首位时，则是留存者中录入顺序最末的一位（末位评首位）。
+      其旧意见失效（valid=0）并换发新的匿名分配凭据（nonce 更新、gen+1）；
       其他人的稿件、版本、意见与链接原样保留。不支持补人或恢复。
     """
     data = request.get_json(silent=True) or {}
@@ -535,17 +537,20 @@ def remove_participant(host_token):
             conn.rollback()
             return err(f"移除后不足 {MIN_PEOPLE} 人，不能移除", 409)
 
-        # 原录入顺序中退出者前面最近的一位留存者：原来由 ta 评退出者，移除后改评下一位
+        # 原来评退出者的人：原录入顺序中退出者前面最近的一位留存者，移除后改评下一位
         predecessor = conn.execute(
             "SELECT * FROM participants WHERE session_id=? AND active=1 AND position<?"
             " ORDER BY position DESC LIMIT 1",
             (session["id"], removed["position"]),
         ).fetchone()
         if predecessor is None:
+            # 退出者前面没有留存者（退出者原为当前首位）：环闭合处"末位评首位"，
+            # 原来评退出者的是当前留存者中录入顺序最末的一位（不是退出者后面第一位——
+            # 那是退出者原来评的人）。此时退出者 position 最小，末位必非退出者本人
             predecessor = conn.execute(
-                "SELECT * FROM participants WHERE session_id=? AND active=1 AND position>?"
-                " ORDER BY position LIMIT 1",
-                (session["id"], removed["position"]),
+                "SELECT * FROM participants WHERE session_id=? AND active=1"
+                " ORDER BY position DESC LIMIT 1",
+                (session["id"],),
             ).fetchone()
 
         # 退出者永久退出：active=0 后其 token 与全部历史链接在所有接口上按不存在处理
