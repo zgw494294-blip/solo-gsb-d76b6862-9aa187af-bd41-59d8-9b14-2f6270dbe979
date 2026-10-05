@@ -1026,6 +1026,130 @@ class RemoveMemberTest(unittest.TestCase):
         )
         self.assertEqual(resp.status_code, 404)
 
+    def test_remove_first_member_reassigns_last_member_only(self):
+        """移除首位：仅末位（原评首位者）改评并换发凭据；其余人稿件/版本/意见/链接/凭据不变。"""
+        # 四人稿件版本相同（均 v1）且均已评审：甲评乙、乙评丙、丙评丁、丁评甲
+        self.submit_all_v1()
+        before = {n: state(self.client, self.tokens[n]) for n in self.names}
+
+        self.assertEqual(remove_member(self.client, self.host_token, "甲").status_code, 200)
+
+        # 丁（末位，原来评甲）改评乙：旧意见失效并标注分配改变，凭据换发
+        s_ding = state(self.client, self.tokens["丁"])
+        self.assertEqual(s_ding["assignment"]["manuscript"], "稿乙")
+        self.assertEqual(s_ding["assignment"]["version"], 1)
+        self.assertNotEqual(
+            s_ding["assignment"]["credential"], before["丁"]["assignment"]["credential"]
+        )
+        self.assertFalse(s_ding["my_review"]["valid"])
+        self.assertTrue(s_ding["my_review"]["target_changed"])
+        self.assertEqual(s_ding["my_review"]["content"], "丁评")
+
+        # 乙、丙的稿件、版本、意见、个人链接与分配凭据全部不变（不错撤乙的意见）
+        for n in ["乙", "丙"]:
+            s = state(self.client, self.tokens[n])
+            self.assertEqual((s["manuscript"], s["version"]), ("稿" + n, 1))
+            self.assertEqual(
+                s["assignment"]["credential"], before[n]["assignment"]["credential"]
+            )
+            self.assertTrue(s["my_review"]["valid"])
+            self.assertEqual(s["my_review"]["content"], n + "评")
+
+        # 丁缺少凭据或沿用旧凭据提交：409 且不写入（丁仍只有那条已失效的旧意见）
+        resp = submit_review(self.client, self.tokens["丁"], "丁无凭据", 1)
+        self.assertEqual(resp.status_code, 409)
+        self.assertTrue(resp.get_json()["assignment_changed"])
+        resp = submit_review(
+            self.client, self.tokens["丁"], "丁旧凭据", 1,
+            credential=before["丁"]["assignment"]["credential"],
+        )
+        self.assertEqual(resp.status_code, 409)
+        s_ding = state(self.client, self.tokens["丁"])
+        self.assertFalse(s_ding["my_review"]["valid"])
+        self.assertEqual(s_ding["my_review"]["content"], "丁评")
+
+        # 补齐意见前不能公布（乙缺有效意见）；丁持新凭据+当前版本提交后才可公布
+        resp = self.client.post(f"/api/h/{self.host_token}/publish")
+        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(resp.get_json()["missing"], ["乙"])
+        self.assertEqual(
+            submit_review(
+                self.client, self.tokens["丁"], "丁评乙", 1,
+                credential=s_ding["assignment"]["credential"],
+            ).status_code,
+            200,
+        )
+        self.assertEqual(
+            self.client.post(f"/api/h/{self.host_token}/publish").status_code, 200
+        )
+        # 公布后：乙收到丁的新意见，丙仍收到乙的、丁仍收到丙的（均未受影响）
+        self.assertEqual(state(self.client, self.tokens["乙"])["received"], "丁评乙")
+        self.assertEqual(state(self.client, self.tokens["丙"])["received"], "乙评")
+        self.assertEqual(state(self.client, self.tokens["丁"])["received"], "丙评")
+
+    def test_remove_current_first_repeatedly_five_people(self):
+        """五人连续移除当前首位：每次仅末位留存者改评并换发凭据，其余人不变。"""
+        five = ["甲", "乙", "丙", "丁", "戊"]
+        host, tokens = create_named_session(new_client(), five)
+        c = new_client()
+        # 五人版本相同且均已评审：甲评乙、乙评丙、丙评丁、丁评戊、戊评甲
+        for n in five:
+            s = state(c, tokens[n])
+            self.assertEqual(
+                submit_review(c, tokens[n], n + "评", s["assignment"]["version"]).status_code,
+                200,
+            )
+        creds = {n: state(c, tokens[n])["assignment"]["credential"] for n in five}
+
+        # 第一次移除当前首位甲：仅末位戊改评乙，戊旧意见失效、凭据换发；乙丙丁不变
+        self.assertEqual(remove_member(c, host, "甲").status_code, 200)
+        self.assertEqual(c.get(f"/api/p/{tokens['甲']}").status_code, 404)
+        s_wu = state(c, tokens["戊"])
+        self.assertEqual(s_wu["assignment"]["manuscript"], "稿乙")
+        self.assertNotEqual(s_wu["assignment"]["credential"], creds["戊"])
+        self.assertFalse(s_wu["my_review"]["valid"])
+        self.assertTrue(s_wu["my_review"]["target_changed"])
+        for n in ["乙", "丙", "丁"]:
+            s = state(c, tokens[n])
+            self.assertEqual(s["assignment"]["credential"], creds[n])
+            self.assertTrue(s["my_review"]["valid"])
+        # 戊沿用旧凭据 409；持新凭据 + 当前版本提交成功
+        self.assertEqual(
+            submit_review(c, tokens["戊"], "戊旧凭据", 1, credential=creds["戊"]).status_code,
+            409,
+        )
+        creds["戊"] = s_wu["assignment"]["credential"]
+        self.assertEqual(
+            submit_review(c, tokens["戊"], "戊评乙", 1, credential=creds["戊"]).status_code,
+            200,
+        )
+
+        # 第二次移除当前首位乙：仍仅末位戊改评丙，凭据再次换发；丙丁不变
+        self.assertEqual(remove_member(c, host, "乙").status_code, 200)
+        self.assertEqual(c.get(f"/api/p/{tokens['乙']}").status_code, 404)
+        s_wu = state(c, tokens["戊"])
+        self.assertEqual(s_wu["assignment"]["manuscript"], "稿丙")
+        self.assertNotEqual(s_wu["assignment"]["credential"], creds["戊"])
+        self.assertFalse(s_wu["my_review"]["valid"])
+        for n in ["丙", "丁"]:
+            s = state(c, tokens[n])
+            self.assertEqual(s["assignment"]["credential"], creds[n])
+            self.assertTrue(s["my_review"]["valid"])
+        self.assertEqual(
+            submit_review(c, tokens["戊"], "戊无凭据", 1).status_code, 409
+        )
+        creds["戊"] = s_wu["assignment"]["credential"]
+        self.assertEqual(
+            submit_review(c, tokens["戊"], "戊评丙", 1, credential=creds["戊"]).status_code,
+            200,
+        )
+
+        # 环闭合为 丙→丁→戊→丙 且意见全部有效：可公布，各人收到对应意见
+        self.assertEqual(c.post(f"/api/h/{host}/publish").status_code, 200)
+        self.assertEqual(state(c, tokens["丙"])["received"], "戊评丙")
+        self.assertEqual(state(c, tokens["丁"])["received"], "丙评")
+        self.assertEqual(state(c, tokens["戊"])["received"], "丁评")
+
     def test_remove_first_and_last_positions(self):
         # 五人：移除首位甲——其原评审者是录入顺序末位的戊，戊改评乙
         five = ["甲", "乙", "丙", "丁", "戊"]

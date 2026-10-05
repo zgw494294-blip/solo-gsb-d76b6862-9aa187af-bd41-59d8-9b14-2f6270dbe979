@@ -13,7 +13,8 @@
   新链接沿用同一参与者的稿件、版本、分配、意见与问答，不重建身份、不使意见失效。
 - 公布前主持人可凭主持链接与姓名移除成员（不能补人、不能恢复）：留存成员按原录入顺序
   重新闭合互评环，移除后至少留 3 人。退出者的个人链接永久失效（一切读取与写入 404），
-  其发出或收到的意见均不计入公布条件；仅"原来评退出者"的人改评下一位留存成员，
+  其发出或收到的意见均不计入公布条件；仅"原来评退出者"的人改评下一位留存成员
+  （退出的是当前首位留存者时，由环上末位留存者改评——末位评首位），
   其旧意见失效并换发新的匿名分配凭据，其他人的稿件、版本、意见与链接全部保留。
 - 参与状态随快照返回不暴露作者身份的分配凭据；提交意见同时校验凭据与稿件版本，
   分配改变后缺少凭据或沿用旧凭据一律 409（即使两篇稿件版本号相同）；分配从未变过时
@@ -499,9 +500,10 @@ def remove_participant(host_token):
     - 退出者标记为不再留存（active=0）：其个人链接（以及换发前的历史链接）永久失效，
       之后的状态读取与一切合法写入（改稿、意见、问题、答复、换发）均 404。
     - 留存成员按原录入顺序重新闭合互评环；退出者发出或收到的意见一律不计入公布条件。
-      仅"原来评退出者"的留存成员（即录入顺序中退出者前面最近的一位留存者）改评下一位
-      留存成员：其旧意见失效（valid=0）并换发新的匿名分配凭据（nonce 更新、gen+1）；
-      其他人的稿件、版本、意见与链接原样保留。不支持补人或恢复。
+      仅"原来评退出者"的留存成员（录入顺序中退出者前面最近的一位留存者；退出者是当前
+      首位留存者时，为环上末位留存者——末位评首位）改评下一位留存成员：其旧意见失效
+      （valid=0）并换发新的匿名分配凭据（nonce 更新、gen+1）；其他人的稿件、版本、
+      意见与链接原样保留。不支持补人或恢复。
     """
     data = request.get_json(silent=True) or {}
     name = data.get("name")
@@ -542,9 +544,11 @@ def remove_participant(host_token):
             (session["id"], removed["position"]),
         ).fetchone()
         if predecessor is None:
+            # 退出者是当前首位留存者：原来评 ta 的是环上末位留存者（末位评首位），
+            # 不能取退出者之后第一位——那是退出者自己评审的对象，会错撤其意见与凭据
             predecessor = conn.execute(
                 "SELECT * FROM participants WHERE session_id=? AND active=1 AND position>?"
-                " ORDER BY position LIMIT 1",
+                " ORDER BY position DESC LIMIT 1",
                 (session["id"], removed["position"]),
             ).fetchone()
 
@@ -554,8 +558,8 @@ def remove_participant(host_token):
         )
 
         if predecessor is not None:
-            new_target = get_target(conn, session["id"], predecessor["position"])
             # 仅 predecessor 的分配改变：旧意见失效 + 换发新的匿名分配凭据；
+            # 新分配对象由 get_target 按留存成员动态得出，无需落库；
             # 其他人的稿件、版本、意见与链接全部保留
             conn.execute(
                 "UPDATE reviews SET valid=0 WHERE reviewer_id=? AND valid=1",
